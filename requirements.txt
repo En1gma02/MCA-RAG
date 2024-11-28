@@ -1,0 +1,6 @@
+streamlit
+PyMuPDF
+huggingface_hub
+langchain
+langchain-community
+sentence-transformers
