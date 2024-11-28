@@ -1,21 +1,22 @@
 import os
 import streamlit as st
 import fitz  # PyMuPDF
-from openai import OpenAI
+from huggingface_hub import InferenceClient
 from langchain_community.vectorstores import FAISS
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.retrievers import EnsembleRetriever
 from langchain.retrievers.bm25 import BM25Retriever
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from typing import List, Optional
+from typing import List, Dict
 
-# Embedding and model configurations
+# Configurations
 EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
 FAISS_INDEX_PATH = 'faiss_index.faiss'
 BOOKS_DIRECTORY = 'Books'
+DEFAULT_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-# Prompt template for RAG
-RAG_PROMPT_TEMPLATE = """You are a helpful AI assistant for the subject Microcontroller & Applications-II in B.Tech Electronics and Telecommunication Engineering.  
+# Prompt Template for RAG
+RAG_PROMPT_TEMPLATE = """You are a helpful AI assistant for the subject Microcontroller & Applications in B.Tech Electronics and Telecommunication Engineering.  
 
 Given the following context from documents:  
 {context}  
@@ -36,10 +37,6 @@ Query: {query}
 Answer:"""
 
 
-# Initialize session state for chat history if not exists
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-
 # Load embedding model and FAISS index
 @st.cache_resource
 def load_index():
@@ -56,41 +53,15 @@ def create_ensemble_retriever(_faiss_index, _embedding_model):
     
     ensemble_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, faiss_retriever],
-        weights=[0.5, 0.5]
+        weights=[0.25, 0.75]
     )
     
     return ensemble_retriever
 
 # Retrieve relevant chunks
-def retrieve_relevant_chunks(query: str, ensemble_retriever, top_k: int = 4) -> List[str]:
+def retrieve_relevant_chunks(query: str, ensemble_retriever, top_k: int = 4) -> str:
     results = ensemble_retriever.get_relevant_documents(query)[:top_k]
-    return [result.page_content for result in results]
-
-# Generate OpenAI response with RAG
-def generate_rag_response(query: str, context: List[str], api_key: Optional[str] = None) -> str:
-    if not api_key:
-        return "Please provide an OpenAI API key."
-    
-    client = OpenAI(api_key=api_key)
-    
-    # Prepare context string
-    context_str = "\n\n".join(context)
-    
-    # Prepare prompt
-    prompt = RAG_PROMPT_TEMPLATE.format(context=context_str, query=query)
-    
-    # Generate response
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant specialized in retrieving information from documents."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Error generating response: {str(e)}"
+    return "\n\n".join([result.page_content for result in results])
 
 # Index new documents
 def index_new_documents(uploaded_files):
@@ -123,13 +94,24 @@ def index_new_documents(uploaded_files):
     faiss_index.save_local(FAISS_INDEX_PATH)
     return faiss_index
 
-# Main Streamlit app
+# Chat with Mixtral
+def chat_with_mixtral(client, messages):
+    try:
+        completion = client.chat.completions.create(
+            model=DEFAULT_MODEL, 
+            messages=messages, 
+            max_tokens=1000
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# Streamlit App
 def main():
-    # Sidebar configuration
     st.sidebar.title("Your MCA Assistant")
     
-    # OpenAI API Key Input
-    api_key = st.sidebar.text_input("OpenAI API Key", type="password")
+    # Mixtral API Key Input
+    api_key = st.sidebar.text_input("Hugging Face API Key", type="password")
     
     # Document Upload
     st.sidebar.subheader("Upload New Documents")
@@ -140,14 +122,14 @@ def main():
     )
     
     if uploaded_files:
-        with st.sidebar.spinner('Indexing documents...'):
+        with st.spinner('Indexing documents...'):
             try:
                 faiss_index = index_new_documents(uploaded_files)
                 st.sidebar.success(f"Successfully indexed {len(uploaded_files)} documents!")
             except Exception as e:
                 st.sidebar.error(f"Error indexing documents: {e}")
 
-    # Book List and Download
+    # Books
     books = [f for f in os.listdir(BOOKS_DIRECTORY) if f.endswith('.pdf')]
     st.sidebar.subheader("Available Books")
     for book in books:
@@ -164,40 +146,60 @@ def main():
                 )
     
     
-    # Main chat interface
-    st.title("Document Chat")
+    # Chat Interface
+    st.title("MCA Conversational Assistant")
     
-    # Display chat history
-    for message in st.session_state.chat_history:
+    # Initialize chat history
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    
+    # Display chat messages
+    for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
-    # Chat input
-    if query := st.chat_input("Ask a question about your documents"):
-        # Add user message to chat history
-        st.session_state.chat_history.append({"role": "user", "content": query})
-        
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(query)
-        
-        # Retrieve context
+    # User input
+    if api_key:
         try:
+            client = InferenceClient(token=api_key)
+
+            # RAG Setup
             faiss_index, embedding_model = load_index()
             ensemble_retriever = create_ensemble_retriever(faiss_index, embedding_model)
-            context_chunks = retrieve_relevant_chunks(query, ensemble_retriever)
+
+            # User input
+            if prompt := st.chat_input("Ask me anything about your documents"):
+                # Add user message to chat history
+                st.session_state.messages.append({"role": "user", "content": prompt})
+
+                # Display user message immediately
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+                # Retrieve context
+                context = retrieve_relevant_chunks(prompt, ensemble_retriever)
+
+                # Prepare messages for Mixtral
+                messages = [
+                    {
+                    "role": "user",
+                    "content": RAG_PROMPT_TEMPLATE.format(context=context, query=prompt)
+                    }
+                ]
+
+            # Generate response using chat_with_mixtral
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    response = chat_with_mixtral(client, messages)
+                    st.markdown(response)
+
+            # Add assistant response to chat history
+            st.session_state.messages.append({"role": "assistant", "content": response})
+
         except Exception as e:
-            st.error(f"Error retrieving documents: {e}")
-            return
-        
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("Generating response..."):
-                response = generate_rag_response(query, context_chunks, api_key)
-                st.markdown(response)
-        
-        # Add assistant response to chat history
-        st.session_state.chat_history.append({"role": "assistant", "content": response})
+            st.error(f"Error initializing Mixtral: {e}")
+    else:
+        st.info("Please enter your Hugging Face API key in the sidebar.")
 
 if __name__ == "__main__":
     main()
